@@ -1,0 +1,21 @@
+column,type,description
+customer_id,integer,Unique account key; one row per customer after duplicate/key resolution.
+signup_date,Date,"Account creation date, parsed from three original layouts."
+last_order_date,Date,Most recent order date; NA where it failed the signup-date or extract-date cross-checks.
+age,integer,"Self-reported age at signup; imputed with the sample median where missing or outside [18, 100]."
+age_imputed,logical,TRUE if age was filled by median imputation rather than observed.
+region,character,One of Northeast/Midwest/Southeast/West; corrected or filled from state where it disagreed with or was missing given the state.
+region_imputed,logical,TRUE if region was filled from the state -> region lookup rather than originally present.
+state,character,Two-letter USPS state abbreviation.
+channel,character,One of Online/In-Store/Phone.
+annual_income,double,"Self-reported household income band midpoint (USD); imputed with the region median where missing, negative, or a sentinel code."
+annual_income_imputed,logical,TRUE if annual_income was filled by regional median imputation rather than observed.
+orders,integer,Lifetime completed orders; NA where the raw value was below 1. Not imputed.
+total_spent,double,Lifetime gross spend (USD); NA where blank or an unrecoverable outlier. Not imputed -- see the missing-data strategy section.
+total_spent_missing,logical,TRUE if total_spent is NA and should be excluded from spend aggregates.
+email,character,"Contact email as delivered, whitespace-trimmed only."
+email_valid,logical,TRUE if email matches a well-formed address pattern; NA if email itself is blank.
+newsletter_opt_in,logical,Marketing email consent flag.
+tenure_days,double,Days between signup_date and the extract date (2026-08-31).
+days_since_last_order,double,Days between last_order_date and the extract date; NA where last_order_date is NA.
+avg_order_value,double,total_spent / orders; NA whenever either input is NA.
