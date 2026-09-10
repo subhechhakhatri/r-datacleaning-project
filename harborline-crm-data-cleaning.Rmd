@@ -1,0 +1,762 @@
+---
+title: 'Harborline Outfitters: Data Wrangling and Cleaning a CRM Extract'
+author: "Subhechha Khatri"
+date: "2026-09-04"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: readable
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = FALSE)
+library(tidyverse)
+options(width = 100)
+
+# Extract date: nothing in this file may legitimately post-date this.
+AS_OF <- as.Date("2026-08-31")
+```
+
+# Introduction and Methodology
+Harborline's analytics team wants to build regional segmentation and a churn model on their CRM extract.
+
+The CRM extract contains *205 records across 12 fields* and has never been reviewed or cleaned. It includes duplicate customer records with conflicting information, dates in different formats, financial values stored as text, placeholder values for missing information, and several unrealistic values; for example, a customer with an age of 203 and a lifetime spend of nearly $2 million.
+
+## Data Cleaning Process
+This project follows a structured data-cleaning process with each step designed to address a specific business risk and prepare the data for the next stage:
+
+1. *Inspect raw data*: Load all fields as text before making any changes. 
+
+2. *Remove duplicates*: Remove duplicate records and extra spaces to maintain one reliable record per customer.
+
+3. *Fix data formats*: Convert placeholders to missing values, standardize dates, and convert financial fields to numbers.
+
+4. *Standardize categories*: Align inconsistent information for categories such as location so that the same value was not recorded in multiple ways. (Eg: US,USA, United States, America, United States of America)
+
+5. *Check for unrealistic or conflicting information*: Review values against reasonable business rules such as valid age ranges and logical relationships between customer fields.
+
+6. *Handle missing information*: Apply a missing-data strategy after correctable errors are resolved.
+
+7. *Verify the final dataset*: Confirm quality checks for every record.
+
+All findings and summary figures are generated directly from the analysis code, making the process consistent, repeatable, and easy to verify.
+
+
+# Step 1: Load and Inventory
+
+## Reading Every Column as Text
+
+```{r load}
+raw <- read_csv(
+  "Harborline_Customers_RAW.csv",
+  col_types = cols(.default = col_character()), #read as text
+  na = c("") #treat empty cell as missing
+)
+```
+
+```{r Inspect, echo=TRUE, message=FALSE, warning=FALSE}
+cat("Dimensions:", nrow(raw), "rows x", ncol(raw), "columns\n\n")
+print(head(raw), width = Inf)
+
+cat("\nMissing values by column (blanks only, before sentinel handling):\n") 
+print(colSums(is.na(raw)))
+
+cat("\nDistinct values per column:\n")
+print(sapply(raw, n_distinct))
+
+cat("\nRegion levels:\n");  print(sort(unique(raw$region)))
+
+cat("\nChannel levels:\n"); print(sort(unique(raw$channel)))
+
+cat("\nOpt-in levels:\n");  print(sort(unique(raw$newsletter_opt_in)))
+```
+All columns are read as text to prevent R from making assumptions about the data type. This is important because fields like annual_income and age contain values such as "N/A", "-999", "unknown", and "999".
+
+Reading the data as text lets us identify and handle these values correctly before performing any analysis.
+
+
+## Fault Inventory
+
+The raw dataset is checked for missing values, inconsistent formats, invalid values, and duplicate records. The table below summarizes each data-quality issue and the number of affected rows.
+
+```{r fault-inventory, echo=TRUE, warning=FALSE}
+# 1. Improved date format function with NA handling and flexible spacing/digits
+date_format <- function(x) {
+  x <- str_squish(x) # Remove trailing/leading spaces before checking
+  case_when(
+    is.na(x) ~ NA_character_,
+    str_detect(x, "^\\d{4}-\\d{2}-\\d{2}$") ~ "YYYY-MM-DD",
+    str_detect(x, "^\\d{1,2}/\\d{1,2}/\\d{4}$") ~ "M/D/YYYY", 
+    str_detect(x, "^\\d{1,2}-[A-Za-z]{3}-\\d{4}$") ~ "DD-Mon-YYYY",
+    TRUE ~ "Other"
+  )
+}
+
+# Keep individual column tracking instead of concatenating them, 
+# or aggregate them cleanly if preferred.
+date_formats <- c(
+  date_format(raw$signup_date),
+  date_format(raw$last_order_date)
+)
+
+fault_inventory <- tribble(
+  ~Column, ~`Fault type`, ~`Rows affected`,
+
+  "customer_id",
+  "Duplicate/repeated IDs",
+  sum(duplicated(raw$customer_id)),
+
+  "signup_date / last_order_date",
+  "YYYY-MM-DD format",
+  sum(date_formats == "YYYY-MM-DD", na.rm = TRUE),
+
+  "signup_date / last_order_date",
+  "MM/DD/YYYY format",
+  sum(date_formats == "M/D/YYYY", na.rm = TRUE),
+
+  "signup_date / last_order_date",
+  "DD-Mon-YYYY format",
+  sum(date_formats == "DD-Mon-YYYY", na.rm = TRUE),
+
+  "age",
+  "Missing or sentinel values",
+  sum(is.na(raw$age)) +
+    sum(str_to_lower(str_squish(raw$age)) %in% c("unknown", "999"), na.rm = TRUE),
+
+  "age",
+  "Values outside 18-100 (excluding sentinel codes)",
+  sum(
+    !str_to_lower(str_squish(raw$age)) %in% c("unknown", "999") &
+      (parse_number(raw$age) < 18 | parse_number(raw$age) > 100),
+    na.rm = TRUE
+  ),
+
+  "region",
+  "Missing or non-standard values",
+  sum(is.na(raw$region) | !raw$region %in% c("Northeast", "Midwest", "Southeast", "West")),
+
+  "state",
+  "Full state names instead of abbreviations",
+  sum(raw$state %in% state.name, na.rm = TRUE),
+
+  "channel",
+  "Non-standard values",
+  sum(!raw$channel %in% c("Online", "In-Store", "Phone"), na.rm = TRUE),
+
+  "annual_income",
+  "Currency formatting",
+  sum(str_detect(raw$annual_income, "\\$"), na.rm = TRUE),
+
+  "annual_income",
+  "Missing or sentinel values",
+  sum(is.na(raw$annual_income) | str_to_lower(str_squish(raw$annual_income)) %in% c("n/a", "unknown", "-999")),
+
+  "orders",
+  "Values below 1",
+  sum(parse_number(raw$orders) < 1, na.rm = TRUE),
+
+  "total_spent",
+  "Comma formatting",
+  sum(str_detect(raw$total_spent, ","), na.rm = TRUE),
+
+  "total_spent",
+  "Missing or extreme values",
+  sum(is.na(raw$total_spent) | parse_number(raw$total_spent) > 100000),
+
+  "email",
+  "Missing or malformed addresses",
+  sum(is.na(raw$email) | !str_detect(str_squish(raw$email), "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$")),
+
+  "newsletter_opt_in",
+  "Missing or non-standard values",
+  sum(is.na(raw$newsletter_opt_in) | !raw$newsletter_opt_in %in% c("Yes", "No")),
+
+  "(all columns)",
+  "Exact duplicate rows",
+  sum(duplicated(raw %>% mutate(across(where(is.character), str_squish))))
+)
+
+knitr::kable(fault_inventory, caption = "Fault inventory of the raw dataset")
+```
+
+The inventory identifies **`r nrow(fault_inventory)` distinct fault classes** across the twelve columns. These findings define the cleaning steps that follow.
+
+## Level Counts
+
+```{r level-counts}
+level_check <- tibble(
+  column   = c("region", "state", "channel", "newsletter_opt_in"),
+  observed = c(n_distinct(raw$region), n_distinct(raw$state), n_distinct(raw$channel), n_distinct(raw$newsletter_opt_in)),
+  expected = c(4, 50, 3, 2)
+)
+
+knitr::kable(level_check, caption = "Observed vs. expected levels")
+```
+
+`region` should have **4** levels, `state` up to **50**, `channel` **3**, and `newsletter_opt_in` **2**. The gap between observed and expected levels indicates that the extra values are mainly **formatting and encoding inconsistencies**, rather than genuinely different categories. These values can therefore be standardized systematically in the next step.
+
+
+# Step 2: Duplicates & Keys
+
+## Whitespace and Exact Duplicates
+
+A running ledger so the report can reconcile every row that leaves the table. Any step that changes the row count is piped through log_step().
+```{r ledger-setup}
+ledger <- tibble(step = "raw file", rows = nrow(raw))
+log_step <- function(df, label) {
+  ledger <<- add_row(ledger, step = label, rows = nrow(df))
+  df
+}
+```
+
+Whitespace is trimmed before checking for duplicates. This is important because values such as "Northeast" and "Northeast " are technically different to the system, even though they mean the same thing. Cleaning the text first ensures that duplicate records are identified correctly and that the same standardized values are used throughout the analysis.
+```{r trim}
+raw_trimmed <- raw %>% mutate(across(where(is.character), str_squish))
+
+n_exact_dup_rows <- sum(duplicated(raw_trimmed))
+cat("Rows before exact-duplicate removal:", nrow(raw_trimmed), "\n")
+
+after_exact <- raw_trimmed %>% distinct() %>% log_step("after exact-duplicate removal")
+
+cat("Rows after exact-duplicate removal:", nrow(after_exact), "\n")
+cat("Exact duplicate rows removed:", nrow(raw_trimmed) - nrow(after_exact), "\n")
+```
+
+`r n_exact_dup_rows` rows are exact duplicates across all twelve columns. Row count goes from `r nrow(raw_trimmed)` to `r nrow(after_exact)`.
+
+
+## Conflicting `customer_id` Records
+
+```{r conflicts}
+conflicting_ids <- after_exact %>% count(customer_id) %>% filter(n > 1) %>% pull(customer_id)
+
+after_exact %>%
+  filter(customer_id %in% conflicting_ids) %>%
+  arrange(customer_id) %>%
+  knitr::kable(caption = "customer_id values that still repeat after exact duplicates are removed")
+```
+
+`r length(conflicting_ids)` `customer_id` values still appear more than once. In each case, the records match on key customer details — including signup date, demographics, and email — but differ in `channel` and `total_spent`. This suggests the records represent the same customers captured from different source-system snapshots, rather than separate customers.
+
+
+## Resolving the Conflict
+
+```{r resolve-conflict}
+resolved <- after_exact %>%
+  mutate(total_spent_tmp = parse_number(total_spent)) %>%
+  arrange(customer_id, desc(total_spent_tmp)) %>%
+  group_by(customer_id) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(-total_spent_tmp) %>%
+  log_step("after resolving conflicting customer_id records")
+
+stopifnot(!any(duplicated(resolved$customer_id)))
+cat("Rows after resolving conflicting keys:", nrow(resolved), "\n")
+```
+
+I retained the record with the higher `total_spent` when the same `customer_id` had conflicting values, since lifetime spend is cumulative and a higher value likely represents the more recent record. This avoids unnecessary data loss while retaining the most defensible record. However, the rule remains an assumption; a CRM audit log with creation or update timestamps would be needed to confirm which record is actually more recent.
+
+
+
+# Step 3: Types and Formats
+
+## Date Formats
+
+There are **three date formats** in the file: `YYYY-MM-DD`, `MM/DD/YYYY`, and `DD-Mon-YYYY`. All three are parsed in a single step.
+
+```{r dates}
+typed <- resolved
+
+# Parse all three date formats in a single pass
+parse_all_dates <- function(x) {
+  parse_date_time(x, orders = c("Ymd", "mdY", "dby"), quiet = TRUE) %>% as.Date()
+}
+
+typed <- typed %>%
+  mutate(
+    signup_date     = parse_all_dates(signup_date),
+    last_order_date = parse_all_dates(last_order_date)
+  )
+
+n_signup_fail <- sum(is.na(typed$signup_date))
+n_last_fail   <- sum(is.na(typed$last_order_date))
+
+cat("signup_date parse failures:", n_signup_fail, "\n")
+cat("last_order_date parse failures:", n_last_fail, "\n")
+```
+
+Neither date column had blanks to begin with, so any `NA` after parsing means a genuine failure — there are **`r n_signup_fail + n_last_fail`**.
+
+
+## Incorrect Date Parsing
+
+```{r wrong-parse-demo}
+demo_wrong_parse <- as.Date(resolved$signup_date, format = "%Y-%m-%d")
+cat("Rows silently turned to NA by the single-format parse:", sum(is.na(demo_wrong_parse)), "\n")
+```
+
+When `as.Date(x, format = "%Y-%m-%d")` is applied, rows using the other two date layouts are silently converted to `NA` rather than producing an error. 
+
+This is more dangerous than a parsing error that stops the script because the process continues normally, making valid dates appear to be genuinely missing and allowing the resulting data loss to go unnoticed. Consequently, downstream calculations such as customer tenure and temporal checks may be distorted without any clear warning.
+
+
+## Converting Income and Spending
+
+The values that prevent a direct `as.numeric()` conversion are `"N/A"` and `"unknown"` — these are text values rather than numeric measurements. Values such as `-999` convert successfully even though they are actually missing-value codes, which is exactly the trap covered next.
+
+```{r income}
+# Mean before handling sentinel values
+naive_income <- resolved %>%
+  transmute(v = as.numeric(str_remove_all(annual_income, "[$,]"))) %>%
+  pull(v)
+
+naive_mean <- mean(naive_income, na.rm = TRUE)
+
+cat("Naive mean (sentinels treated as real numbers):", scales::dollar(round(naive_mean, 2)), "\n")
+```
+
+After the sentinel codes (identified in the next section) are converted to `NA`, `annual_income` and `total_spent` are converted to numeric, along with `age`, `orders`, and `customer_id` so every later range check and join operates on the correct type.
+
+```{r typed-conversion, echo=TRUE, warning=FALSE}
+is_sentinel <- function(x, sentinels) str_to_lower(str_squish(x)) %in% str_to_lower(sentinels)
+
+age_sentinels    <- c("unknown", "999")
+income_sentinels <- c("N/A", "unknown", "-999")
+
+typed <- typed %>%
+  mutate(
+    age           = if_else(is_sentinel(age, age_sentinels), NA_character_, age),
+    annual_income = if_else(is_sentinel(annual_income, income_sentinels), NA_character_, annual_income),
+    annual_income = parse_number(annual_income),
+    total_spent   = parse_number(total_spent),
+    age           = as.integer(age),
+    orders        = as.integer(orders),
+    customer_id   = as.integer(customer_id)
+  )
+
+clean_mean <- mean(typed$annual_income, na.rm = TRUE)
+cat("Clean mean (sentinels handled first):", scales::dollar(round(clean_mean, 2)), "\n")
+```
+
+The mean annual income changes from `r scales::dollar(round(naive_mean, 2))` to `r scales::dollar(round(clean_mean, 2))` once the sentinel values are handled correctly, rather than being averaged in as if they were real incomes.
+
+## Sentinel Values
+
+The sentinel values identified in the file are:
+
+- `age`: `"unknown"`, `999`
+- `annual_income`: `"N/A"`, `"unknown"`, `-999`
+
+These values represent missing information rather than valid measurements, so they are converted to `NA` before the numeric conversion shown above. This ensures they are excluded from the corrected mean rather than being interpreted as legitimate numerical values. Converting them after numeric parsing would be too late, because they could already be treated as valid—but incorrect—numbers, which would distort the analysis.
+
+
+# Step 4: Categorical Standardization
+
+## Standardizing Categorical Values
+
+The `region`, `state`, and `channel` fields are standardized to consistent labels and formats. No rows are removed during this process, so the row count remains unchanged before and after standardization.
+
+```{r standardize}
+count_levels <- function(x) length(unique(x[!is.na(x)]))
+
+standardized <- typed %>%
+  mutate(
+    region = case_when(
+      str_to_upper(region) %in% c("NORTHEAST", "NE") ~ "Northeast",
+      str_to_upper(region) == "MIDWEST"               ~ "Midwest",
+      str_to_upper(region) == "SOUTHEAST"             ~ "Southeast",
+      str_to_upper(region) == "WEST"                  ~ "West",
+      TRUE                                              ~ NA_character_
+    ),
+
+    state = if_else(state %in% state.name, state.abb[match(state, state.name)], state),
+
+    channel = case_when(
+      str_to_upper(channel) %in% c("ONLINE", "O", "WEB")                 ~ "Online",
+      str_to_upper(channel) %in% c("IN-STORE", "IN STORE", "STORE", "S") ~ "In-Store",
+      str_to_upper(channel) %in% c("PHONE", "TELEPHONE", "P")           ~ "Phone",
+      TRUE                                                              ~ NA_character_
+    )
+  )
+
+level_recon <- tibble(
+  column        = c("region", "state", "channel"),
+  levels_before = c(count_levels(typed$region), count_levels(typed$state), count_levels(typed$channel)),
+  levels_after  = c(count_levels(standardized$region), count_levels(standardized$state), count_levels(standardized$channel)),
+  rows_before   = nrow(typed),
+  rows_after    = nrow(standardized)
+)
+
+knitr::kable(level_recon, caption = "Level counts before and after standardization")
+
+stopifnot(nrow(standardized) == nrow(typed))
+```
+
+The row count reconciles before and after standardization, confirming that every row remains accounted for. The process only standardizes labels; it does not remove records.
+
+## Standardizing Newsletter Opt-In
+
+`newsletter_opt_in` is converted to a logical column, with `TRUE` representing an opt-in and `FALSE` representing no opt-in. Logical is the appropriate type because this field represents a simple two-option condition, making it easier to filter, count, and analyze consistently than a character column that could silently accept a stray value.
+
+```{r optin}
+n_optin_before <- count_levels(standardized$newsletter_opt_in)
+
+standardized <- standardized %>%
+  mutate(
+    newsletter_opt_in = case_when(
+      str_to_upper(newsletter_opt_in) %in% c("YES", "Y", "TRUE", "T", "1") ~ TRUE,
+      str_to_upper(newsletter_opt_in) %in% c("NO", "N", "FALSE", "F", "0") ~ FALSE,
+      TRUE ~ NA
+    )
+  )
+
+n_optin_after <- count_levels(standardized$newsletter_opt_in)
+cat("newsletter_opt_in levels before:", n_optin_before, "| after:", n_optin_after, "\n")
+print(table(standardized$newsletter_opt_in, useNA = "ifany"))
+```
+
+## Standardizing State Values
+
+I used Base R’s built-in `state.name` and `state.abb` vectors to create a standardized crosswalk for all 50 U.S. states. This approach reduces the risk of spelling errors and missing entries that can occur with manually created lookup tables. The resulting crosswalk was then used to standardize the `state` variable alongside `region` and `channel`, as shown above.
+
+
+# Step 5: Range and logic validation
+
+## Range and Business Rules
+
+The observed ranges are reported below. Values are treated as **impossible**, rather than simply unusual, only when they violate a defined business rule.
+
+```{r ranges}
+cat("Observed ranges BEFORE recoding:\n")
+cat("age:            ", paste(range(standardized$age, na.rm = TRUE), collapse = " to "), "\n")
+cat("annual_income:  ", paste(range(standardized$annual_income, na.rm = TRUE), collapse = " to "), "\n")
+cat("orders:         ", paste(range(standardized$orders, na.rm = TRUE), collapse = " to "), "\n")
+cat("total_spent:    ", paste(range(standardized$total_spent, na.rm = TRUE), collapse = " to "), "\n")
+```
+
+Business rules applied:
+
+- **Age:** Customers must be between 18 and 100 years old. Values outside this range are treated as invalid.
+- **Annual income:** Income cannot be negative, so negative values are treated as invalid.
+- **Orders:** Every customer in this extract must have at least one completed order, so values below 1 are invalid.
+- **Total spent:** The extreme outlier is reviewed separately, below, rather than automatically treated as impossible based only on its size.
+
+The invalid values are cleared rather than replaced because the correct value cannot be determined from the available data.
+
+```{r recode}
+n_age_before <- sum(is.na(standardized$age))
+n_inc_before <- sum(is.na(standardized$annual_income))
+n_ord_before <- sum(is.na(standardized$orders))
+
+validated <- standardized %>%
+  mutate(
+    age           = if_else(age < 18 | age > 100, NA_integer_, age),
+    annual_income = if_else(annual_income < 0, NA_real_, annual_income),
+    orders        = if_else(orders < 1, NA_integer_, orders)
+  )
+
+cat("Values newly recoded to NA:\n")
+cat("  age:           ", sum(is.na(validated$age)) - n_age_before, "\n")
+cat("  annual_income: ", sum(is.na(validated$annual_income)) - n_inc_before, "\n")
+cat("  orders:        ", sum(is.na(validated$orders)) - n_ord_before, "\n")
+```
+
+## Extreme total_spent Value
+
+I removed the extreme `total_spent` outlier to prevent it from distorting key metrics such as average and total revenue. Rather than capping the value with an arbitrary threshold—which would introduce a synthetic number—I removed only the anomalous value while preserving the customer’s other valid data. This keeps the analysis grounded in observed transactions and ensures the resulting metrics better reflect typical customer behavior.
+
+
+```{r outlier}
+n_spent_before <- sum(is.na(validated$total_spent))
+
+validated <- validated %>%
+  mutate(total_spent = if_else(total_spent > 100000, NA_real_, total_spent))
+
+cat("total_spent values newly recoded to NA:", sum(is.na(validated$total_spent)) - n_spent_before, "\n")
+```
+
+## Cross-Column Validation
+
+Three business rules are checked:
+
+- An order cannot occur before the customer signs up.
+- A date cannot occur after the August 31, 2026 extract date.
+- Each state must correspond to one region.
+
+When a rule is violated, the affected field is corrected or cleared rather than deleting the entire row. This preserves the customer's other valid information while removing only the value that cannot be trusted.
+
+### Date Rules
+
+For the two date rules, `last_order_date` is cleared when it conflicts with the signup date or falls after the extract date. The signup date is retained because it represents a one-time customer event, while the last-order date is more likely to change or be affected by transaction-level data issues.
+
+```{r date-rules}
+bad_order_before_signup <- validated$last_order_date < validated$signup_date
+bad_future_date          <- validated$last_order_date > AS_OF
+
+n_before_signup <- sum(bad_order_before_signup, na.rm = TRUE)
+n_future        <- sum(bad_future_date, na.rm = TRUE)
+
+cat("Rows where last_order_date precedes signup_date:", n_before_signup, "\n")
+cat("Rows where last_order_date is after the extract date:", n_future, "\n")
+
+validated <- validated %>%
+  mutate(last_order_date = if_else(bad_order_before_signup | bad_future_date, as.Date(NA), last_order_date))
+```
+
+### Geography Rule
+
+For the geography conflict, `state` is trusted over `region`. `state` is a specific geographic value that can be independently verified, while `region` is a broader classification that can be derived from the state. Therefore, when the two disagree, the region is corrected rather than deleting the customer record.
+
+```{r step5b-geography}
+region_lookup <- validated %>%
+  filter(!is.na(region)) %>%
+  count(state, region) %>%
+  group_by(state) %>%
+  slice_max(n, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(state, true_region = region)
+
+region_conflicts <- validated %>%
+  filter(!is.na(region)) %>%
+  left_join(region_lookup, by = "state") %>%
+  filter(region != true_region)
+
+n_region_conflicts <- nrow(region_conflicts)
+cat("Rows where region contradicts the region implied by state:", n_region_conflicts, "\n")
+
+region_conflicts %>%
+  select(customer_id, state, region, true_region) %>%
+  knitr::kable()
+
+validated <- validated %>%
+  left_join(region_lookup, by = "state") %>%
+  mutate(region = if_else(!is.na(region) & region != true_region, true_region, region)) %>%
+  select(-true_region)
+```
+
+*Summary:* `r n_before_signup` rows have an order date before signup, `r n_future` rows have a date after the extract date, and `r n_region_conflicts` rows have a region that conflicts with their state. In each case, only the unreliable field is corrected or cleared, rather than removing the entire customer record.
+
+### Email Format Validation
+
+Email addresses are checked against a standard pattern for a well-formed address. Records are kept regardless of the result, since an invalid or unreachable email is a fact about the customer rather than a reason to remove them.
+
+```{r step5c-email}
+validated <- validated %>%
+  mutate(email_valid = str_detect(email, "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"))
+
+cat(
+  "Email valid:", sum(validated$email_valid, na.rm = TRUE),
+  "| invalid:", sum(!validated$email_valid, na.rm = TRUE),
+  "| blank:", sum(is.na(validated$email_valid)), "\n"
+)
+```
+
+```{r step5-checkpoint}
+cat("Missing values after Step 5:\n")
+print(colSums(is.na(validated)))
+```
+
+# Step 6: Missing Data Strategy
+
+## The Cost of Listwise Deletion
+
+The number of missing values entering this step is shown above. Using `drop_na()` would remove every row containing at least one missing value.
+
+```{r step6-dropna-cost}
+would_drop <- validated %>% drop_na()
+
+n_would_keep <- nrow(would_drop)
+n_would_lose <- nrow(validated) - n_would_keep
+
+cat("Rows drop_na() would keep:", n_would_keep, "of", nrow(validated), "\n")
+cat("Rows drop_na() would discard:", n_would_lose,
+    sprintf("(%.1f%% of the resolved extract)\n", 100 * n_would_lose / nrow(validated)))
+```
+
+`drop_na()` would reduce the dataset to `r n_would_keep` rows, removing `r round(100 * n_would_lose / nrow(validated), 1)`% of the available customer records. This is too much information to lose for a segmentation analysis, where retaining enough customers across regions is important for meaningful comparisons.
+
+## A Missing-Data Strategy per Column
+
+Different strategies are used for each column because the missing values have different meanings and the columns serve different purposes in the analysis.
+
+| Column | Strategy | Reason |
+|---|---|---|
+| `age` | Global median | Age is a supporting variable, so the median provides a simple and reasonable estimate without heavily influencing the analysis. |
+| `annual_income` | Median within region | Income can vary by region, so a regional median provides a more representative estimate than one overall value. |
+| `region` | Derive from `state` | Region is a known geographic relationship, so it can be recovered from the customer's state rather than estimated. |
+| `total_spent` | Leave as `NA` | It is the key outcome being analyzed, so replacing missing values with estimates could distort the final spending results. |
+
+```{r strategy}
+# Region: derive from the customer's state
+clean <- validated %>%
+  left_join(region_lookup, by = "state") %>%
+  mutate(
+    region_imputed = is.na(region),
+    region         = coalesce(region, true_region)
+  ) %>%
+  select(-true_region)
+
+# Age: replace missing values with the overall median
+age_median <- median(clean$age, na.rm = TRUE)
+
+clean <- clean %>%
+  mutate(
+    age_imputed = is.na(age),
+    age         = if_else(is.na(age), as.integer(round(age_median)), age)
+  )
+
+# Annual income: replace missing values with the median within region
+income_by_region <- clean %>%
+  group_by(region) %>%
+  summarise(med_income = median(annual_income, na.rm = TRUE), .groups = "drop")
+
+clean <- clean %>%
+  left_join(income_by_region, by = "region") %>%
+  mutate(
+    annual_income_imputed = is.na(annual_income),
+    annual_income          = if_else(is.na(annual_income), med_income, annual_income)
+  ) %>%
+  select(-med_income) %>%
+  # Total spend is left missing rather than estimated
+  mutate(total_spent_missing = is.na(total_spent))
+
+cat("Missing values after Step 6:\n")
+print(colSums(is.na(clean)))
+```
+
+The strategies are intentionally different: known relationships are used where possible, simple imputation is used for supporting variables, and the key outcome is left unchanged when it cannot be reliably recovered.
+
+## Why total_spent Is Not Imputed
+
+`total_spent` is left as `NA` because it is the metric the CFO wants to compare across regions; imputing it would introduce estimated values directly into the final calculation and could distort the reported average. Imputing `annual_income` does not create the same problem because income is a supporting variable, not the measure being reported, so estimating missing income does not directly change the lifetime-spend calculation.
+
+`orders` is not one of the four columns above and is left with its remaining missing values as well — a lifetime order count is not something that can be reasonably reconstructed from other fields, so a downstream analyst should treat it the same way as missing `total_spent`: unknown, not zero.
+
+# Step 7: Verification and Handoff
+
+## Verifying the Final Dataset
+
+The final dataset is verified using assertions that check the structural, data type, categorical, range, and cross-column rules established in the earlier steps. A row reconciliation table is also used to document how the dataset changed throughout the cleaning process.
+
+```{r derive}
+clean <- clean %>%
+  mutate(
+    tenure_days           = as.numeric(AS_OF - signup_date),
+    days_since_last_order = as.numeric(AS_OF - last_order_date),
+    avg_order_value       = round(total_spent / orders, 2)
+  )
+
+ledger <- add_row(ledger, step = "final clean file", rows = nrow(clean))
+```
+
+```{r assertions}
+stopifnot(
+  # Structural checks
+  !any(duplicated(clean$customer_id)),
+  is.integer(clean$customer_id),
+  nrow(clean) == 200,
+
+  # Data types
+  inherits(clean$signup_date, "Date"),
+  inherits(clean$last_order_date, "Date"),
+  is.logical(clean$newsletter_opt_in),
+  is.logical(clean$email_valid),
+
+  # Valid categorical values
+  all(clean$region %in% c("Northeast", "Midwest", "Southeast", "West") | is.na(clean$region)),
+  all(clean$channel %in% c("Online", "In-Store", "Phone")),
+  all(nchar(clean$state) == 2),
+
+  # Range and business rules
+  all(clean$age >= 18 & clean$age <= 100, na.rm = TRUE),
+  all(clean$annual_income >= 0, na.rm = TRUE),
+  all(clean$orders >= 1, na.rm = TRUE),
+  all(clean$total_spent <= 100000, na.rm = TRUE),
+
+  # Cross-column rules
+  all(clean$last_order_date >= clean$signup_date, na.rm = TRUE),
+  all(clean$last_order_date <= AS_OF, na.rm = TRUE),
+  all(clean$signup_date <= AS_OF, na.rm = TRUE)
+)
+
+cat("All post-conditions passed.\n")
+```
+
+The assertions pass, confirming that the final file satisfies the rules enforced during cleaning.
+
+```{r step7-ledger}
+ledger %>%
+  mutate(change = rows - lag(rows)) %>%
+  knitr::kable(caption = "Row reconciliation throughout the cleaning process")
+```
+
+The reconciliation table accounts for changes in row count at each cleaning stage and documents where rows were removed.
+
+```{r step7-write}
+dir.create("output", showWarnings = FALSE)
+write_csv(clean, "output/harborline_customers_clean.csv")
+
+data_dictionary <- tribble(
+  ~column,                  ~type,       ~description,
+  "customer_id",            "integer",   "Unique account key; one row per customer after duplicate/key resolution.",
+  "signup_date",             "Date",      "Account creation date, parsed from three original layouts.",
+  "last_order_date",         "Date",      "Most recent order date; NA where it failed the signup-date or extract-date cross-checks.",
+  "age",                     "integer",   "Self-reported age at signup; imputed with the sample median where missing or outside [18, 100].",
+  "age_imputed",             "logical",   "TRUE if age was filled by median imputation rather than observed.",
+  "region",                  "character", "One of Northeast/Midwest/Southeast/West; corrected or filled from state where it disagreed with or was missing given the state.",
+  "region_imputed",          "logical",   "TRUE if region was filled from the state -> region lookup rather than originally present.",
+  "state",                   "character", "Two-letter USPS state abbreviation.",
+  "channel",                 "character", "One of Online/In-Store/Phone.",
+  "annual_income",           "double",    "Self-reported household income band midpoint (USD); imputed with the region median where missing, negative, or a sentinel code.",
+  "annual_income_imputed",   "logical",   "TRUE if annual_income was filled by regional median imputation rather than observed.",
+  "orders",                  "integer",   "Lifetime completed orders; NA where the raw value was below 1. Not imputed.",
+  "total_spent",             "double",    "Lifetime gross spend (USD); NA where blank or an unrecoverable outlier. Not imputed -- see the missing-data strategy section.",
+  "total_spent_missing",     "logical",   "TRUE if total_spent is NA and should be excluded from spend aggregates.",
+  "email",                   "character", "Contact email as delivered, whitespace-trimmed only.",
+  "email_valid",             "logical",   "TRUE if email matches a well-formed address pattern; NA if email itself is blank.",
+  "newsletter_opt_in",       "logical",   "Marketing email consent flag.",
+  "tenure_days",              "double",    "Days between signup_date and the extract date (2026-08-31).",
+  "days_since_last_order",    "double",    "Days between last_order_date and the extract date; NA where last_order_date is NA.",
+  "avg_order_value",          "double",    "total_spent / orders; NA whenever either input is NA."
+)
+write_csv(data_dictionary, "output/harborline_data_dictionary.csv")
+
+cat("Clean file and data dictionary written to /output.\n")
+```
+
+### Handoff Decision
+
+**I would hand this file to the segmentation team**, with the condition that estimated or recovered values are clearly identified.
+
+Of the `r nrow(clean)` customers:
+
+- **`r sum(clean$age_imputed)`** have an imputed age.
+- **`r sum(clean$annual_income_imputed)`** have an imputed income.
+- **`r sum(clean$region_imputed)`** have a region recovered from state.
+- **`r sum(clean$total_spent_missing)`** have no usable `total_spent`.
+- **`r sum(is.na(clean$orders))`** have no usable `orders` count.
+
+The *_imputed* and *_missing* flags clearly identify records affected by missing or estimated values.
+
+**Key limitation:** Some cleaning decisions are based on reasonable assumptions rather than confirmed CRM records. Where customer records conflicted, the higher total_spent was retained, and state was used when it conflicted with region. Without a CRM audit log, these choices cannot be independently verified and should be kept in mind when interpreting customer-level results.
+
+# Conclusion
+
+Harborline's extract is analysis-ready, but there is some information loss that may affect the analysis. 
+
+Of the 205 raw rows, `r 205 - nrow(clean)` are removed due to duplicates or conflicting keys. `r n_before_signup + n_future` order dates, `r sum(is.na(clean$orders))` order counts, and `r sum(clean$total_spent_missing)` spend totals remain missing where the correct values cannot be determined.
+
+A smaller number of ages, incomes, and regions are estimated and clearly flagged. All changes are documented in the reconciliation table and corresponding flags.
+
+
+# Tools and Acknowledgments
+
+Built with base R and the tidyverse (`dplyr`, `stringr`, `lubridate`, `readr`). I used Gemini and ChatGPT at points while refining the code and tightening some of the explanations; the conversations are linked here for transparency:
+
+- Code refinement (Gemini): https://share.gemini.google/h4L0LzBOzodv
+- Writing refinement (ChatGPT): https://chatgpt.com/share/6a9f6a11-7d6c-83ea-93e1-330ea6284178
